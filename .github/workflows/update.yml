@@ -1,0 +1,70 @@
+name: Update bundled binaries
+
+on:
+  schedule:
+    - cron: '23 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      unison:
+        description: Unison version (blank selects latest if both inputs are blank)
+        type: string
+      watcher:
+        description: macOS watcher version (blank keeps current when Unison is specified)
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-binaries
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      sha: ${{ steps.pr.outputs.pull-request-head-sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: astral-sh/setup-uv@v10.1.0
+      - run: uv sync --locked --dev
+      - name: Fetch releases and update checksums and notices
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UNISON_VERSION: ${{ inputs.unison }}
+          WATCHER_VERSION: ${{ inputs.watcher }}
+        run: |
+          args=()
+          if [[ -n "$UNISON_VERSION" ]]; then args+=(--unison "$UNISON_VERSION"); fi
+          if [[ -n "$WATCHER_VERSION" ]]; then args+=(--watcher "$WATCHER_VERSION"); fi
+          uv run --no-sync python -m tools.update_binaries "${args[@]}"
+      - uses: peter-evans/create-pull-request@v8
+        id: pr
+        with:
+          branch: automation/unison-update
+          delete-branch: true
+          add-paths: |
+            unison-artifacts.json
+            third_party/
+          commit-message: Update bundled Unison and watcher
+          title: Update bundled Unison and watcher
+          body: |
+            Updates the selected binaries, checksums and license notices.
+
+            The update workflow runs CI on this commit for all four targets.
+            Review changed notices before merging; the updater does not establish license compatibility.
+
+  # GITHUB_TOKEN-created PRs do not trigger pull_request workflows.
+  # Run the same checks explicitly, using the exact commit produced above.
+  test-update:
+    needs: update
+    if: needs.update.outputs.sha != ''
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.update.outputs.sha }}
