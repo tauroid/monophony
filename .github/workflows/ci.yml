@@ -76,13 +76,13 @@ jobs:
           uv run --no-sync python -c 'import monophony; from pathlib import Path; assert "site-packages" in Path(monophony.__file__).parts, monophony.__file__'
           uv run --no-sync monophony -version
           uv run --no-sync python -m pytest -q
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.python == '3.14'
         with:
           name: wheel-${{ matrix.target }}
           path: dist/*.whl
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.target == 'linux_x86_64' && matrix.python == '3.14'
         with:
           name: sdist
