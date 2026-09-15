@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to test (defaults to the triggering commit)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10
+      - run: uv sync --locked --dev
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+      - run: uv run --no-sync actionlint
+
+  wheels:
+    name: ${{ matrix.target }} / Python ${{ matrix.python }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.14']
+        target: [linux_x86_64, windows_x86_64, macos_arm64, macos_x86_64]
+        include:
+          - runner: ubuntu-latest
+            target: linux_x86_64
+          - runner: windows-latest
+            target: windows_x86_64
+          - runner: macos-15
+            target: macos_arm64
+          - runner: macos-15-intel
+            target: macos_x86_64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked --dev
+      - name: Check required test tools
+        run: |
+          git --version
+          uv run --no-sync monophony -version
+      - name: Build from the source distribution
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          uv build --sdist --no-sources
+          uv build dist/*.tar.gz --wheel --no-sources --config-setting "target=$TARGET"
+      - name: Install the wheel instead of the editable package
+        run: uv pip install --reinstall dist/*.whl
+      - name: Test installed wheel
+        run: |
+          uv run --no-sync python -c 'import monophony; from pathlib import Path; assert "site-packages" in Path(monophony.__file__).parts, monophony.__file__'
+          uv run --no-sync monophony -version
+          uv run --no-sync python -m pytest -q
+      - uses: actions/upload-artifact@v4
+        if: matrix.python == '3.14'
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'linux_x86_64' && matrix.python == '3.14'
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
