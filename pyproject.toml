@@ -5,8 +5,8 @@ backend-path = ["."]
 
 [project]
 name = "monophony"
-version = "0.1.0"
-description = "Unison live synchronization with checked Git ignore translation"
+version = "0.1.1"
+description = "Python wrapper for Unison File Synchronizer with .gitignore translation"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "GPL-3.0-or-later"
