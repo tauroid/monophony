@@ -112,6 +112,20 @@ class GitSemanticsTests(unittest.TestCase):
         for combination in itertools.product(rules, repeat=2):
             self.compare("\n".join(combination), paths)
 
+    def test_longer_ordered_rule_set(self):
+        rules = "*.log\n!keep.log\nlogs/\n!logs/\nlogs/*.tmp\n!logs/keep.tmp\n"
+        paths = [
+            "a.log",
+            "keep.log",
+            "logs",
+            "logs/a.log",
+            "logs/a.tmp",
+            "logs/keep.tmp",
+            "other/a.tmp",
+            "deep/keep.log",
+        ]
+        self.compare(rules, paths)
+
     def test_nested_scope_and_pruning(self):
         (self.root / ".gitignore").write_text("*.log\nblocked/\n")
         (self.root / "sub").mkdir()
@@ -176,6 +190,22 @@ class CompilerTests(unittest.TestCase):
 
         with patch.object(L, "MAX_STATES", 2), self.assertRaises(TranslationError):
             L.regex(L.literal("abcd"))
+
+    def test_many_literal_rules_do_not_exhaust_automaton_states(self):
+        rules = "".join(f"file{i}.log\n" for i in range(120))
+        result = policy(parse(rules))
+        self.assertTrue(result.ignored("file119.log"))
+        self.assertFalse(result.ignored("file120.log"))
+        self.assertTrue(compile_policies([result]))
+
+    def test_distinct_literal_rules_compile(self):
+        rules = "".join(f"{i:04x}{(i * 7919) % 65536:04x}.log\n" for i in range(40))
+        self.assertTrue(compile_policies([policy(parse(rules))]))
+
+    def test_policy_is_minimized_before_final_checks(self):
+        rules = "".join(f"{i:04x}{(i * 7919) % 65536:04x}.log\n" for i in range(80))
+        result = policy(parse(rules))
+        self.assertLess(len(L.dfa(result.files)[1]), 300)
 
     def test_typed_directory_policy(self):
         result = policy(parse("build/"))

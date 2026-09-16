@@ -6,6 +6,7 @@ No filesystem entries are used to construct these languages.
 """
 
 from collections import deque
+from dataclasses import dataclass
 from functools import lru_cache
 
 from .errors import TranslationError
@@ -13,8 +14,17 @@ from .errors import TranslationError
 EMPTY = ("zero",)
 EPSILON = ("one",)
 ALPHABET = frozenset(range(1, 256))  # NUL cannot occur in a filename.
-MAX_STATES = 256
+MAX_STATES = 1024
+MAX_INTERMEDIATE_STATES = 8192
 MAX_REGEX = 24_000
+
+
+@dataclass(frozen=True, eq=False)
+class Machine:
+    alphabet: tuple
+    edges: tuple
+    accepting: frozenset
+    initial: int
 
 
 def chars(values):
@@ -64,6 +74,71 @@ def intersection(left, right):
     return difference(left, difference(left, right))
 
 
+def compiled(item, *, intermediate_limit=MAX_INTERMEDIATE_STATES):
+    if item == EMPTY or item[0] == "machine":
+        return item
+    alphabet, edges, accepting = dfa(item, max_states=intermediate_limit)
+    edges, accepting, initial = minimize(edges, accepting)
+    if not accepting:
+        return EMPTY
+    if len(edges) > MAX_STATES:
+        raise TranslationError(f"Path matcher exceeds {MAX_STATES} minimized states")
+    machine = Machine(tuple(alphabet), tuple(map(tuple, edges)), frozenset(accepting), initial)
+    return ("machine", machine, initial)
+
+
+@lru_cache(maxsize=4096)
+def combine(left, right, *, subtract=False):
+    """Combine minimized matchers, minimizing after each ordered rule."""
+    if right == EMPTY:
+        return left
+    if left == EMPTY:
+        return EMPTY if subtract else right
+    left_machine, left_start = left[1:]
+    right_machine, right_start = right[1:]
+    alphabet = []
+    columns = []
+    for i, left_group in enumerate(left_machine.alphabet):
+        for j, right_group in enumerate(right_machine.alphabet):
+            group = left_group & right_group
+            if group:
+                alphabet.append(group)
+                columns.append((i, j))
+    states = [(left_start, right_start)]
+    indices = {states[0]: 0}
+    edges = []
+    accepting = set()
+    for pair in states:
+        a, b = pair
+        accepted = (
+            (a in left_machine.accepting and b not in right_machine.accepting)
+            if subtract
+            else (a in left_machine.accepting or b in right_machine.accepting)
+        )
+        if accepted:
+            accepting.add(indices[pair])
+        row = []
+        for i, j in columns:
+            destination = (left_machine.edges[a][i], right_machine.edges[b][j])
+            if destination not in indices:
+                if len(states) >= MAX_INTERMEDIATE_STATES:
+                    raise TranslationError(
+                        "Cannot convert .gitignore rules: combining path matchers "
+                        f"exceeds {MAX_INTERMEDIATE_STATES} intermediate states"
+                    )
+                indices[destination] = len(states)
+                states.append(destination)
+            row.append(indices[destination])
+        edges.append(row)
+    edges, accepting, initial = minimize(edges, accepting)
+    if not accepting:
+        return EMPTY
+    if len(edges) > MAX_STATES:
+        raise TranslationError(f"Path matcher exceeds {MAX_STATES} minimized states")
+    machine = Machine(tuple(alphabet), tuple(map(tuple, edges)), frozenset(accepting), initial)
+    return ("machine", machine, initial)
+
+
 @lru_cache(maxsize=32768)
 def nullable(item):
     op = item[0]
@@ -71,6 +146,8 @@ def nullable(item):
         return True
     if op in ("zero", "chars"):
         return False
+    if op == "machine":
+        return item[2] in item[1].accepting
     if op == "union":
         return any(map(nullable, item[1]))
     if op == "seq":
@@ -85,6 +162,10 @@ def derivative(item, byte):
         return EMPTY
     if op == "chars":
         return EPSILON if byte in item[1] else EMPTY
+    if op == "machine":
+        machine = item[1]
+        column = next(i for i, group in enumerate(machine.alphabet) if byte in group)
+        return ("machine", machine, machine.edges[item[2]][column])
     if op == "union":
         return union(*(derivative(x, byte) for x in item[1]))
     if op == "difference":
@@ -117,6 +198,8 @@ def partitions(item):
         seen.add(part)
         if part[0] == "chars":
             predicates.add(part[1])
+        elif part[0] == "machine":
+            predicates.update(part[1].alphabet)
         elif part[0] in ("seq", "union"):
             pending.extend(part[1])
         elif part[0] in ("star", "difference"):
@@ -127,7 +210,9 @@ def partitions(item):
     return sorted(groups, key=min)
 
 
-def dfa(item):
+def dfa(item, *, max_states=None):
+    if max_states is None:
+        max_states = MAX_STATES
     alphabet = partitions(item)
     states = [item]
     indices = {item: 0}
@@ -137,8 +222,11 @@ def dfa(item):
         for group in alphabet:
             dest = derivative(state, min(group))
             if dest not in indices:
-                if len(states) >= MAX_STATES:
-                    raise TranslationError(f"Language exceeds {MAX_STATES} states")
+                if len(states) >= max_states:
+                    raise TranslationError(
+                        "Cannot convert .gitignore rules: the path-matching automaton "
+                        f"exceeds {max_states} intermediate states"
+                    )
                 indices[dest] = len(states)
                 states.append(dest)
             row.append(indices[dest])
@@ -206,13 +294,15 @@ def regex(item):
         for dest, values in by_dest.items():
             graph[i, dest] = chars(values)
     while useful:
-
-        def cost(k, graph=graph):
-            return sum(b == k and a != k for a, b in graph) * sum(
-                a == k and b != k for a, b in graph
-            )
-
-        k = min(useful, key=lambda k: (cost(k), k))
+        incoming_counts = {k: 0 for k in useful}
+        outgoing_counts = {k: 0 for k in useful}
+        for a, b in graph:
+            if a != b:
+                if b in incoming_counts:
+                    incoming_counts[b] += 1
+                if a in outgoing_counts:
+                    outgoing_counts[a] += 1
+        k = min(useful, key=lambda k: (incoming_counts[k] * outgoing_counts[k], k))
         incoming = [(a, r) for (a, b), r in graph.items() if b == k and a != k]
         outgoing = [(b, r) for (a, b), r in graph.items() if a == k and b != k]
         loop = star(graph.get((k, k), EMPTY))

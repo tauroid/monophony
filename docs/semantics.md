@@ -7,7 +7,7 @@ mode without Unicode normalization. Patterns are limited to ASCII, but wildcard
 matches can contain any filename bytes.
 
 The intermediate representation (IR) consists of the empty set, the empty string, character sets, union,
-concatenation, Kleene star (zero or more concatenations), and set difference.
+concatenation, Kleene star (zero or more concatenations), set difference, and minimized automata.
 Intersection is derived as `A ∩ B = A \ (A \ B)`.
 
 ## Interpreting rules
@@ -16,7 +16,9 @@ Each rule has a scoped path language, an include/exclude decision, a directory-o
 flag, and a source file/line. Its language matches the entry itself, not implicitly
 all descendants. Rules are processed in Git precedence order: outer files first,
 inner files next, lines in source order. Sibling scopes are disjoint, so their
-relative ordering has no effect.
+relative ordering has no effect. Each rule is compiled to an automaton, and the
+combined matcher is minimized after each ordered rule. The valid-path restriction
+is applied after combining rules, so it does not inflate every rule's automaton.
 
 Maintain four languages: direct file exclusions `F`, direct directory exclusions
 `D`, explicit file inclusions `IF`, and explicit directory inclusions `ID`.
@@ -71,7 +73,9 @@ receive the same treatment as other files.
 
 ## Automata and regex output
 
-Brzozowski derivatives construct a deterministic finite automaton (DFA).
+Brzozowski derivatives construct a deterministic finite automaton (DFA) for each
+rule and for the final valid-path restriction. Ordered rule operations use DFA
+products and minimize the result after each operation.
 Character predicates partition the byte alphabet, so transitions are computed
 once for each equivalent byte class. Reachable accepting states decide emptiness;
 breadth-first traversal supplies an example string.
@@ -87,7 +91,9 @@ Compilation stops at these limits, even if a larger translation would be possibl
 - 512 characters per pattern
 - 128 rules across all ignore files in a root
 - 64 ignore files per root
-- 256 DFA states per operation
+- 8,192 temporary DFA states while constructing a matcher
+- 1,024 states after minimization (distinct partial path matches, rather than
+  ignore rules or filesystem entries)
 - 24,000 characters in the output regex
 
 Unsupported syntax produces an error with the source file and line number.

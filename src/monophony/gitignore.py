@@ -134,7 +134,6 @@ def parse(text: str, *, scope="", source=".gitignore"):
                 pattern = L.seq(L.star(L.seq(L.COMPONENT, L.SLASH)), pattern)
             if scope:
                 pattern = L.seq(L.literal(scope), L.SLASH, pattern)
-            pattern = L.intersection(pattern, L.PATHS)
         except TranslationError as exc:
             raise TranslationError(f"{origin}: {exc}") from exc
         rules.append(Rule(pattern, include, directory_only, origin))
@@ -146,24 +145,29 @@ def policy(rules):
         raise TranslationError(f"More than {MAX_RULES} ignore rules")
     files = directories = includes = directory_includes = L.EMPTY
     for rule in rules:
+        pattern = L.compiled(rule.pattern)
         if rule.include:
-            directories = L.difference(directories, rule.pattern)
-            directory_includes = L.union(directory_includes, rule.pattern)
+            directories = L.combine(directories, pattern, subtract=True)
+            directory_includes = L.combine(directory_includes, pattern)
             if not rule.directory_only:
-                files = L.difference(files, rule.pattern)
-                includes = L.union(includes, rule.pattern)
+                files = L.combine(files, pattern, subtract=True)
+                includes = L.combine(includes, pattern)
         else:
-            directories = L.union(directories, rule.pattern)
-            directory_includes = L.difference(directory_includes, rule.pattern)
+            directories = L.combine(directories, pattern)
+            directory_includes = L.combine(directory_includes, pattern, subtract=True)
             if not rule.directory_only:
-                files = L.union(files, rule.pattern)
-                includes = L.difference(includes, rule.pattern)
+                files = L.combine(files, pattern)
+                includes = L.combine(includes, pattern, subtract=True)
     parents = L.descendants(directories)
+
+    def valid_paths(item):
+        return L.compiled(L.intersection(item, L.PATHS))
+
     return Policy(
-        L.union(files, parents),
-        L.union(directories, parents),
-        L.difference(includes, parents),
-        L.difference(directory_includes, parents),
+        valid_paths(L.union(files, parents)),
+        valid_paths(L.union(directories, parents)),
+        valid_paths(L.difference(includes, parents)),
+        valid_paths(L.difference(directory_includes, parents)),
         tuple(rules),
     )
 
@@ -223,15 +227,15 @@ def compile_policies(policies):
                 L.intersection(left.directories, right.directory_includes),
                 L.intersection(right.directories, left.directory_includes),
             )
-            example = L.witness(conflict)
+            example = L.witness(L.compiled(conflict))
             if example is not None:
                 origins = "\n".join(rule.origin for p in (left, right) for rule in p.rules)
                 raise TranslationError(
                     f"Contradictory root policies at {example!r}; rules:\n{origins}"
                 )
-    files = L.union(*(p.files for p in policies))
-    directories = L.union(*(p.directories for p in policies))
-    example = L.witness(L.difference(files, directories))
+    files = L.compiled(L.union(*(p.files for p in policies)))
+    directories = L.compiled(L.union(*(p.directories for p in policies)))
+    example = L.witness(L.compiled(L.difference(files, directories)))
     if example is not None:
         raise TranslationError(
             f"Directory-only inclusion cannot be lowered safely at {example!r}: "
