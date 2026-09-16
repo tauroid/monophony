@@ -117,6 +117,9 @@ class UnisonIntegrationTests(unittest.TestCase):
             "*.log\n!keep.log\nimportant.log\nbuild/\n!build/a.py\n",
             "**/a.py\nsub/*.txt\n!sub/ab.txt\n",
             "[!a-c]*.txt\n\\#literal\n\\!literal\na{b,c}\na -> b\nspace\\ \n",
+            "a/**/a.py\n**/z.txt\nsub/*.log\nbuild/\n",
+            "*\n!keep.log\n",
+            "*\n",
         ]
         for index, text in enumerate(patterns):
             with self.subTest(pattern=text):
@@ -167,6 +170,36 @@ class UnisonIntegrationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 for path in paths:
                     self.assertEqual((b / path).is_file(), path not in ignored, path)
+
+    def test_many_scoped_exclusions_and_local_exception(self):
+        self.put(
+            self.a / ".gitignore",
+            "*.log\n*.tmp\n*.pyc\n*.swp\n*.bak\n*.o\n"
+            "node_modules/\n.venv/\nbuild/\ndist/\n.cache/\n.DS_Store\n",
+        )
+        for i in range(50):
+            scope = f"packages/module-{i:02}"
+            self.put(self.a / scope / "generated/.gitignore", "*\n")
+            self.put(self.a / scope / "generated/file.txt")
+            self.put(self.a / scope / "keep.txt")
+        self.put(self.b / "packages/module-49/generated/remote.txt", "remote only")
+        self.sync()
+        for i in range(50):
+            scope = f"packages/module-{i:02}"
+            self.assertTrue((self.b / scope / "keep.txt").exists())
+            self.assertFalse((self.b / scope / "generated/file.txt").exists())
+        self.assertFalse((self.a / "packages/module-49/generated/remote.txt").exists())
+
+        # A local exception must preserve the other scopes' exclusions.
+        self.put(self.a / "special/.gitignore", "!keep.log\n")
+        self.put(self.b / "special/.gitignore", "!keep.log\n")
+        self.put(self.a / "special/keep.log")
+        self.put(self.a / "special/drop.log")
+        self.put(self.a / "packages/module-00/generated/new.txt")
+        self.sync()
+        self.assertTrue((self.b / "special/keep.log").exists())
+        self.assertFalse((self.b / "special/drop.log").exists())
+        self.assertFalse((self.b / "packages/module-00/generated/new.txt").exists())
 
     def test_parent_deletion_also_deletes_ignored_children(self):
         self.put(self.a / ".gitignore", "build/\n")

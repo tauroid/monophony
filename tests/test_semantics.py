@@ -5,10 +5,11 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from monophony import language as L
 from monophony.errors import TranslationError
-from monophony.gitignore import compile_policies, discover, parse, policy
+from monophony.gitignore import compile_policies, discover, ignore_arguments, parse, policy
 
 
 @unittest.skipUnless(shutil.which("git"), "Git is needed as an independent oracle")
@@ -43,9 +44,11 @@ class GitSemanticsTests(unittest.TestCase):
     def compare(self, text, paths):
         (self.root / ".gitignore").write_text(text)
         actual = policy(parse(text))
+        lowered = L.lower(actual.files, valid_paths=True)
         expected = self.oracle(paths)
         for path in paths:
             self.assertEqual(actual.ignored(path), path in expected, (text, path))
+            self.assertEqual(L.matches(lowered, path), path in expected, (text, path, "lowered"))
 
     def test_order_parent_and_glob_semantics(self):
         patterns = [
@@ -186,10 +189,8 @@ class CompilerTests(unittest.TestCase):
         a, b = L.literal("a"), L.literal("b")
         self.assertIsNone(L.witness(L.difference(L.union(a, b), L.union(b, a))))
         self.assertEqual(L.witness(L.difference(L.union(a, b), a)), "b")
-        from unittest.mock import patch
-
         with patch.object(L, "MAX_STATES", 2), self.assertRaises(TranslationError):
-            L.regex(L.literal("abcd"))
+            L.compiled(L.literal("abcd"))
 
     def test_many_literal_rules_do_not_exhaust_automaton_states(self):
         rules = "".join(f"file{i}.log\n" for i in range(120))
@@ -202,10 +203,42 @@ class CompilerTests(unittest.TestCase):
         rules = "".join(f"{i:04x}{(i * 7919) % 65536:04x}.log\n" for i in range(40))
         self.assertTrue(compile_policies([policy(parse(rules))]))
 
-    def test_policy_is_minimized_before_final_checks(self):
+    def test_ordinary_exclusions_need_no_automata(self):
         rules = "".join(f"{i:04x}{(i * 7919) % 65536:04x}.log\n" for i in range(80))
-        result = policy(parse(rules))
-        self.assertLess(len(L.dfa(result.files)[1]), 300)
+        with patch.object(L, "dfa", side_effect=AssertionError("Unexpected automaton")):
+            self.assertTrue(compile_policies([policy(parse(rules)), policy(parse("*.tmp"))]))
+
+    def test_many_nested_ignore_files_need_no_automata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".gitignore").write_text(
+                "*.log\n*.tmp\n*.pyc\n*.swp\n*.bak\n*.o\n"
+                "node_modules/\n.venv/\nbuild/\ndist/\n.cache/\n.DS_Store\n"
+            )
+            for i in range(50):
+                directory = root / f"packages/module-{i:02}/generated"
+                (directory / "ignored-child").mkdir(parents=True)
+                (directory / ".gitignore").write_text("*\n")
+                (directory / "ignored-child/.gitignore").write_text("unsupported[\n")
+            with patch.object(L, "dfa", side_effect=AssertionError("Unexpected automaton")):
+                arguments = ignore_arguments([root])
+            self.assertTrue(arguments)
+            self.assertLess(sum(map(len, arguments)), 24_000)
+
+    def test_scoped_negation_does_not_pull_in_unrelated_rules(self):
+        rules = parse("*.log\n!keep.log", scope="special")
+        for i in range(50):
+            rules += parse("*", scope=f"packages/module-{i:02}/generated")
+        L.lower.cache_clear()
+        with patch.object(L, "MAX_STATES", 64), patch.object(L, "dfa", wraps=L.dfa) as automata:
+            self.assertTrue(compile_policies([policy(rules)]))
+            self.assertGreater(automata.call_count, 0)
+
+    def test_disjoint_root_policies_need_no_intersection_automaton(self):
+        a = policy(parse("*.log", scope="a"))
+        b = policy(parse("!keep.log", scope="b"))
+        with patch.object(L, "dfa", side_effect=AssertionError("Unexpected automaton")):
+            self.assertTrue(compile_policies([a, b]))
 
     def test_typed_directory_policy(self):
         result = policy(parse("build/"))

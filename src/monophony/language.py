@@ -67,69 +67,60 @@ def star(item):
 def difference(left, right):
     if left == right or left == EMPTY:
         return EMPTY
+    if right[0] == "union" and left in right[1]:
+        return EMPTY
+    if left[0] == "union":
+        return union(*(difference(part, right) for part in left[1]))
+    if right[0] == "union":
+        right = union(*(part for part in right[1] if not disjoint_prefixes(left, part)))
+    elif disjoint_prefixes(left, right):
+        return left
     return left if right == EMPTY else ("difference", left, right)
 
 
 def intersection(left, right):
-    return difference(left, difference(left, right))
+    if left == EMPTY or right == EMPTY or disjoint_prefixes(left, right):
+        return EMPTY
+    if left == right:
+        return left
+    if left[0] == "union":
+        return union(*(intersection(part, right) for part in left[1]))
+    if right[0] == "union":
+        return union(*(intersection(left, part) for part in right[1]))
+    return ("intersection", left, right)
+
+
+@lru_cache(maxsize=32768)
+def literal_prefix(item):
+    """Return a mandatory byte prefix and whether it is the whole expression."""
+    op = item[0]
+    if op == "one":
+        return b"", True
+    if op == "chars" and len(item[1]) == 1:
+        return bytes(item[1]), True
+    if op == "seq":
+        prefix = b""
+        for part in item[1]:
+            value, complete = literal_prefix(part)
+            prefix += value
+            if not complete:
+                return prefix, False
+        return prefix, True
+    if op == "difference":
+        return literal_prefix(item[1])[0], False
+    return b"", False
+
+
+def disjoint_prefixes(left, right):
+    a, _ = literal_prefix(left)
+    b, _ = literal_prefix(right)
+    return not (a.startswith(b) or b.startswith(a))
 
 
 def compiled(item, *, intermediate_limit=MAX_INTERMEDIATE_STATES):
     if item == EMPTY or item[0] == "machine":
         return item
     alphabet, edges, accepting = dfa(item, max_states=intermediate_limit)
-    edges, accepting, initial = minimize(edges, accepting)
-    if not accepting:
-        return EMPTY
-    if len(edges) > MAX_STATES:
-        raise TranslationError(f"Path matcher exceeds {MAX_STATES} minimized states")
-    machine = Machine(tuple(alphabet), tuple(map(tuple, edges)), frozenset(accepting), initial)
-    return ("machine", machine, initial)
-
-
-@lru_cache(maxsize=4096)
-def combine(left, right, *, subtract=False):
-    """Combine minimized matchers, minimizing after each ordered rule."""
-    if right == EMPTY:
-        return left
-    if left == EMPTY:
-        return EMPTY if subtract else right
-    left_machine, left_start = left[1:]
-    right_machine, right_start = right[1:]
-    alphabet = []
-    columns = []
-    for i, left_group in enumerate(left_machine.alphabet):
-        for j, right_group in enumerate(right_machine.alphabet):
-            group = left_group & right_group
-            if group:
-                alphabet.append(group)
-                columns.append((i, j))
-    states = [(left_start, right_start)]
-    indices = {states[0]: 0}
-    edges = []
-    accepting = set()
-    for pair in states:
-        a, b = pair
-        accepted = (
-            (a in left_machine.accepting and b not in right_machine.accepting)
-            if subtract
-            else (a in left_machine.accepting or b in right_machine.accepting)
-        )
-        if accepted:
-            accepting.add(indices[pair])
-        row = []
-        for i, j in columns:
-            destination = (left_machine.edges[a][i], right_machine.edges[b][j])
-            if destination not in indices:
-                if len(states) >= MAX_INTERMEDIATE_STATES:
-                    raise TranslationError(
-                        "Cannot convert .gitignore rules: combining path matchers "
-                        f"exceeds {MAX_INTERMEDIATE_STATES} intermediate states"
-                    )
-                indices[destination] = len(states)
-                states.append(destination)
-            row.append(indices[destination])
-        edges.append(row)
     edges, accepting, initial = minimize(edges, accepting)
     if not accepting:
         return EMPTY
@@ -150,6 +141,8 @@ def nullable(item):
         return item[2] in item[1].accepting
     if op == "union":
         return any(map(nullable, item[1]))
+    if op == "intersection":
+        return nullable(item[1]) and nullable(item[2])
     if op == "seq":
         return all(map(nullable, item[1]))
     return nullable(item[1]) and not nullable(item[2])
@@ -170,6 +163,8 @@ def derivative(item, byte):
         return union(*(derivative(x, byte) for x in item[1]))
     if op == "difference":
         return difference(derivative(item[1], byte), derivative(item[2], byte))
+    if op == "intersection":
+        return intersection(derivative(item[1], byte), derivative(item[2], byte))
     if op == "star":
         return seq(derivative(item[1], byte), item)
     terms = []
@@ -202,7 +197,7 @@ def partitions(item):
             predicates.update(part[1].alphabet)
         elif part[0] in ("seq", "union"):
             pending.extend(part[1])
-        elif part[0] in ("star", "difference"):
+        elif part[0] in ("star", "difference", "intersection"):
             pending.extend(part[1:])
     groups = [ALPHABET]
     for predicate in predicates:
@@ -270,8 +265,8 @@ def minimize(edges, accepting):
     return rows, {groups[i] for i in accepting}, groups[0]
 
 
-def regex(item):
-    """Eliminate DFA states; return None for the empty language."""
+def eliminate(item):
+    """Eliminate DFA states, returning an ordinary regex expression."""
     alphabet, edges, accepting = dfa(item)
     edges, accepting, initial = minimize(edges, accepting)
     useful = set(accepting)
@@ -281,7 +276,7 @@ def regex(item):
             break
         useful = expanded
     if initial not in useful:
-        return None
+        return EMPTY
     start, end = len(edges), len(edges) + 1
     graph = {(start, initial): EPSILON}
     for i in sorted(useful):
@@ -313,7 +308,53 @@ def regex(item):
                 graph[a, b] = result
         graph = {key: value for key, value in graph.items() if k not in key}
         useful.remove(k)
-    return render(graph[start, end])
+    return graph[start, end]
+
+
+@lru_cache(maxsize=4096)
+def lower(item, *, valid_paths=False):
+    """Preserve ordinary regex operations; eliminate only unresolved set operations."""
+    # Only simplify the original component expressions at path boundaries, never
+    # expressions reconstructed by state elimination inside a larger component.
+    if valid_paths and item == COMPONENT:
+        return seq(COMPONENT_CHAR, star(COMPONENT_CHAR))
+    op = item[0]
+    if op in ("difference", "intersection", "machine"):
+        return eliminate(compiled(item))
+    if op == "union":
+        return union(*(lower(part, valid_paths=valid_paths) for part in item[1]))
+    if op == "seq":
+        return seq(*(lower(part, valid_paths=valid_paths) for part in item[1]))
+    if op == "star":
+        return star(lower(item[1], valid_paths=valid_paths))
+    return item
+
+
+@lru_cache(maxsize=4096)
+def without_epsilon(item):
+    """Remove the empty string using ordinary regex operations only."""
+    if not nullable(item):
+        return item
+    if item == EPSILON:
+        return EMPTY
+    if item[0] == "union":
+        return union(*(without_epsilon(part) for part in item[1]))
+    if item[0] == "star":
+        return seq(without_epsilon(item[1]), item)
+    if item[0] == "seq":
+        return union(
+            *(seq(without_epsilon(part), *item[1][i + 1 :]) for i, part in enumerate(item[1]))
+        )
+    raise AssertionError("Set operations must be lowered before removing the empty string")
+
+
+def regex(item, *, valid_paths=False):
+    item = lower(item, valid_paths=valid_paths)
+    if valid_paths:
+        # Unison also tests the empty path representing the synchronization root.
+        # A nullable glob must not prune that root and hide its included children.
+        item = without_epsilon(item)
+    return None if item == EMPTY else render(item)
 
 
 def render(item):
@@ -356,12 +397,17 @@ def render(item):
 
 
 COMPONENT_CHAR = chars(ALPHABET - {ord("/")})
-COMPONENT = difference(
-    seq(COMPONENT_CHAR, star(COMPONENT_CHAR)), union(literal("."), literal(".."))
+NON_DOT = chars(ALPHABET - {ord("/"), ord(".")})
+COMPONENT = union(
+    seq(NON_DOT, star(COMPONENT_CHAR)),
+    seq(literal("."), NON_DOT, star(COMPONENT_CHAR)),
+    seq(literal(".."), COMPONENT_CHAR, star(COMPONENT_CHAR)),
 )
 SLASH = literal("/")
 PATHS = seq(COMPONENT, star(seq(SLASH, COMPONENT)))
 
 
 def descendants(item):
+    if item[0] == "union":
+        return union(*(descendants(part) for part in item[1]))
     return seq(item, SLASH, PATHS)

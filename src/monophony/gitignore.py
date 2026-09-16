@@ -28,7 +28,9 @@ class Policy:
     rules: tuple[Rule, ...]
 
     def ignored(self, path: str, *, directory=False):
-        return L.matches(self.directories if directory else self.files, path)
+        return L.matches(L.PATHS, path) and L.matches(
+            self.directories if directory else self.files, path
+        )
 
 
 def glob(pattern: str):
@@ -145,29 +147,25 @@ def policy(rules):
         raise TranslationError(f"More than {MAX_RULES} ignore rules")
     files = directories = includes = directory_includes = L.EMPTY
     for rule in rules:
-        pattern = L.compiled(rule.pattern)
+        pattern = rule.pattern
         if rule.include:
-            directories = L.combine(directories, pattern, subtract=True)
-            directory_includes = L.combine(directory_includes, pattern)
+            directories = L.difference(directories, pattern)
+            directory_includes = L.union(directory_includes, pattern)
             if not rule.directory_only:
-                files = L.combine(files, pattern, subtract=True)
-                includes = L.combine(includes, pattern)
+                files = L.difference(files, pattern)
+                includes = L.union(includes, pattern)
         else:
-            directories = L.combine(directories, pattern)
-            directory_includes = L.combine(directory_includes, pattern, subtract=True)
+            directories = L.union(directories, pattern)
+            directory_includes = L.difference(directory_includes, pattern)
             if not rule.directory_only:
-                files = L.combine(files, pattern)
-                includes = L.combine(includes, pattern, subtract=True)
+                files = L.union(files, pattern)
+                includes = L.difference(includes, pattern)
     parents = L.descendants(directories)
-
-    def valid_paths(item):
-        return L.compiled(L.intersection(item, L.PATHS))
-
     return Policy(
-        valid_paths(L.union(files, parents)),
-        valid_paths(L.union(directories, parents)),
-        valid_paths(L.difference(includes, parents)),
-        valid_paths(L.difference(directory_includes, parents)),
+        L.union(files, parents),
+        L.union(directories, parents),
+        L.difference(includes, parents),
+        L.difference(directory_includes, parents),
         tuple(rules),
     )
 
@@ -181,10 +179,15 @@ def discover(root: Path):
     root = Path(root)
     rules = []
     count = 0
-    pending = [(root, "")]
+    pending = [(root, "", ())]
     while pending:
-        directory, scope = pending.pop()
-        if scope and policy(rules).ignored(scope, directory=True):
+        directory, scope, active = pending.pop()
+        # Parents were already checked. Only the last direct directory decision
+        # matters here, and sibling ignore files cannot affect this subtree.
+        if scope and next(
+            (not rule.include for rule in reversed(active) if L.matches(rule.pattern, scope)),
+            False,
+        ):
             continue
         ignore = directory / ".gitignore"
         if not ignore.is_symlink() and ignore.exists():
@@ -199,7 +202,9 @@ def discover(root: Path):
                 text = data.decode("utf-8-sig")
             except UnicodeError as exc:
                 raise TranslationError(f"{ignore}: expected UTF-8") from exc
-            rules.extend(parse(text, scope=scope, source=str(ignore)))
+            local = parse(text, scope=scope, source=str(ignore))
+            rules.extend(local)
+            active += tuple(local)
             if len(rules) > MAX_RULES:
                 raise TranslationError(f"More than {MAX_RULES} ignore rules")
         with os.scandir(directory) as entries:
@@ -212,9 +217,22 @@ def discover(root: Path):
                 reverse=True,
             )
         pending.extend(
-            (directory / name, f"{scope}/{name}" if scope else name) for name in children
+            (directory / name, f"{scope}/{name}" if scope else name, active) for name in children
         )
     return policy(rules)
+
+
+def path_witness(item):
+    """Check separate alternatives without constructing their joint automaton."""
+    if item == L.EMPTY:
+        return None
+    if item[0] == "union":
+        for part in item[1]:
+            example = path_witness(part)
+            if example is not None:
+                return example
+        return None
+    return L.witness(L.compiled(L.intersection(item, L.PATHS)))
 
 
 def compile_policies(policies):
@@ -227,22 +245,27 @@ def compile_policies(policies):
                 L.intersection(left.directories, right.directory_includes),
                 L.intersection(right.directories, left.directory_includes),
             )
-            example = L.witness(L.compiled(conflict))
+            example = path_witness(conflict)
             if example is not None:
                 origins = "\n".join(rule.origin for p in (left, right) for rule in p.rules)
                 raise TranslationError(
                     f"Contradictory root policies at {example!r}; rules:\n{origins}"
                 )
-    files = L.compiled(L.union(*(p.files for p in policies)))
-    directories = L.compiled(L.union(*(p.directories for p in policies)))
-    example = L.witness(L.compiled(L.difference(files, directories)))
+    files = L.union(*(p.files for p in policies))
+    directories = L.union(*(p.directories for p in policies))
+    example = path_witness(L.difference(files, directories))
     if example is not None:
         raise TranslationError(
             f"Directory-only inclusion cannot be lowered safely at {example!r}: "
             "Unison would prune an included directory to exclude a same-named file"
         )
-    result = L.regex(files)
-    return [] if result is None else ["-ignore", "Regex " + result]
+    alternatives = files[1] if files[0] == "union" else [files]
+    patterns = sorted(
+        {result for part in alternatives if (result := L.regex(part, valid_paths=True)) is not None}
+    )
+    if sum(map(len, patterns)) > L.MAX_REGEX:
+        raise TranslationError(f"Generated ignore regexes exceed {L.MAX_REGEX} characters in total")
+    return [argument for pattern in patterns for argument in ("-ignore", "Regex " + pattern)]
 
 
 def ignore_arguments(roots):
